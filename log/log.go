@@ -201,5 +201,24 @@ func formatJson(logLevel LogLevel, p []byte) {
 	jsonCh <- event
 }
 
+func Warnln(format string, v ...any) {
+	event := Event{
+		LogLevel: LogLevel(logger.WarnLevel),
+		Payload:  fmt.Sprintf(format, v...),
+	}
+	textCh <- event
+}
+func Infoln(format string, v ...any) {
+	event := Event{
+		LogLevel: LogLevel(logger.InfoLevel),
+		Payload:  fmt.Sprintf(format, v...),
+	}
+	textCh <- event
+}
+
+func Subscribe() observable.Subscription[Event] {
+	return SubscribeText()
+}
+
 //go:linkname parseFormatterArgs github.com/phuslu/log.parseFormatterArgs
 func parseFormatterArgs(_ []byte, _ *logger.FormatterArgs)
