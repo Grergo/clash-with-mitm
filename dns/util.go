@@ -13,7 +13,6 @@ import (
 	D "github.com/miekg/dns"
 	"github.com/phuslu/log"
 
-	"github.com/Dreamacro/clash/adapter"
 	"github.com/Dreamacro/clash/common/cache"
 	"github.com/Dreamacro/clash/common/errors2"
 	"github.com/Dreamacro/clash/common/picker"
@@ -25,21 +24,30 @@ import (
 var errProxyNotFound = errors.New("proxy adapter not found")
 
 func putMsgToCache(c *cache.LruCache[string, *D.Msg], key string, msg *D.Msg) {
+	putMsgToCacheWithExpire(c, key, msg, 0)
+}
+
+func putMsgToCacheWithExpire(c *cache.LruCache[string, *D.Msg], key string, msg *D.Msg, ttl uint32) {
+	if len(msg.Question) == 0 {
+		log.Debug().Str("msg", msg.String()).Msg("[DNS] question msg empty")
+		return
+	}
 	if q := msg.Question[0]; q.Qtype == D.TypeTXT && strings.HasPrefix(q.Name, "_acme-challenge") {
 		return
 	}
 
-	var ttl uint32
-	switch {
-	case len(msg.Answer) != 0:
-		ttl = msg.Answer[0].Header().Ttl
-	case len(msg.Ns) != 0:
-		ttl = msg.Ns[0].Header().Ttl
-	case len(msg.Extra) != 0:
-		ttl = msg.Extra[0].Header().Ttl
-	default:
-		log.Debug().Str("msg", msg.String()).Msg("[DNS] response msg empty")
-		return
+	if ttl == 0 {
+		switch {
+		case len(msg.Answer) != 0:
+			ttl = msg.Answer[0].Header().Ttl
+		case len(msg.Ns) != 0:
+			ttl = msg.Ns[0].Header().Ttl
+		case len(msg.Extra) != 0:
+			ttl = msg.Extra[0].Header().Ttl
+		default:
+			log.Debug().Str("msg", msg.String()).Msg("[DNS] response msg empty")
+			return
+		}
 	}
 
 	c.SetWithExpire(key, msg.Copy(), time.Now().Add(time.Second*time.Duration(ttl)))
@@ -51,21 +59,21 @@ func setMsgTTL(msg *D.Msg, ttl uint32) {
 
 func setMsgTTLWithForce(msg *D.Msg, ttl uint32, force bool) {
 	for _, answer := range msg.Answer {
-		if !force && answer.Header().Ttl >= ttl {
+		if !force && answer.Header().Ttl <= ttl {
 			continue
 		}
 		answer.Header().Ttl = ttl
 	}
 
 	for _, ns := range msg.Ns {
-		if !force && ns.Header().Ttl >= ttl {
+		if !force && ns.Header().Ttl <= ttl {
 			continue
 		}
 		ns.Header().Ttl = ttl
 	}
 
 	for _, extra := range msg.Extra {
-		if !force && extra.Header().Ttl >= ttl {
+		if !force && extra.Header().Ttl <= ttl {
 			continue
 		}
 		extra.Header().Ttl = ttl
@@ -188,7 +196,7 @@ func (wpc *wrapPacketConn) RemoteAddr() net.Addr {
 }
 
 func dialContextWithProxyAdapter(ctx context.Context, adapterName string, network string, dstIP netip.Addr, port string, opts ...dialer.Option) (net.Conn, error) {
-	proxy, ok := tunnel.Proxies()[adapterName]
+	proxy, ok := tunnel.FindProxyByName(adapterName)
 	if !ok {
 		return nil, errProxyNotFound
 	}
@@ -205,7 +213,7 @@ func dialContextWithProxyAdapter(ctx context.Context, adapterName string, networ
 		DstPort: port,
 	}
 
-	rawAdapter := fetchRawProxyAdapter(proxy.(*adapter.Proxy).ProxyAdapter, metadata)
+	rawAdapter, _ := tunnel.FetchRawProxyAdapter(proxy, metadata, nil)
 
 	if networkType == C.UDP {
 		if !rawAdapter.SupportUDP() {
@@ -224,14 +232,6 @@ func dialContextWithProxyAdapter(ctx context.Context, adapterName string, networ
 	}
 
 	return rawAdapter.DialContext(ctx, metadata, opts...)
-}
-
-func fetchRawProxyAdapter(proxyAdapter C.ProxyAdapter, metadata *C.Metadata) C.ProxyAdapter {
-	if p := proxyAdapter.Unwrap(metadata); p != nil {
-		return fetchRawProxyAdapter(p.(*adapter.Proxy).ProxyAdapter, metadata)
-	}
-
-	return proxyAdapter
 }
 
 func batchExchange(ctx context.Context, clients []dnsClient, m *D.Msg) (msg *D.Msg, err error) {

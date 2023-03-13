@@ -88,6 +88,7 @@ Use `curl -X POST controllerip:port/cache/fakeip/flush` to flush persistence fak
    enable: true
    use-hosts: true
    ipv6: false
+   # remote-dns-resolve: true # remote resolve DNS on handle UDP session, default value is true
    enhanced-mode: fake-ip
    fake-ip-range: 198.18.0.1/16
    listen: 127.0.0.1:6868
@@ -398,6 +399,7 @@ proxies:
     private-key: eCtXsJZ27+4PbhDkHnB923tkUn2Gj59wZw5wFA75MnU=
     public-key: Cr8hWlKvtDt7nrvf+f0brNQQzabAqrjfBvas9pmowjo=
     # preshared-key: base64
+    # remote-dns-resolve: true # remote resolve DNS with `dns` field, default is true
     # dns: [1.1.1.1, 8.8.8.8]
     # mtu: 1420
     udp: true

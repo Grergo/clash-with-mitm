@@ -3,6 +3,7 @@ package tunnel
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"net"
 	"net/netip"
 	"path/filepath"
@@ -12,10 +13,12 @@ import (
 	"time"
 
 	"github.com/phuslu/log"
+	"github.com/samber/lo"
 	"go.uber.org/atomic"
 
 	A "github.com/Dreamacro/clash/adapter"
 	"github.com/Dreamacro/clash/adapter/inbound"
+	"github.com/Dreamacro/clash/adapter/outbound"
 	"github.com/Dreamacro/clash/component/nat"
 	P "github.com/Dreamacro/clash/component/process"
 	"github.com/Dreamacro/clash/component/resolver"
@@ -27,9 +30,10 @@ import (
 )
 
 var (
-	tcpQueue     = make(chan C.ConnContext, 200)
-	udpQueue     = make(chan *inbound.PacketAdapter, 200)
-	natTable     = nat.New()
+	tcpQueue     = make(chan C.ConnContext, 512)
+	udpQueue     = make(chan *inbound.PacketAdapter, 1024)
+	natTable     = nat.New[string, C.PacketConn]()
+	addrTable    = nat.New[string, netip.Addr]()
 	rules        []C.Rule
 	proxies      = make(map[string]C.Proxy)
 	providers    map[string]provider.ProxyProvider
@@ -119,6 +123,16 @@ func FindProxyByName(name string) (proxy C.Proxy, found bool) {
 		}
 	}
 	return
+}
+
+func FetchRawProxyAdapter(proxy C.Proxy, metadata *C.Metadata, chains []string) (C.Proxy, []string) {
+	if chains != nil {
+		chains = append(chains, proxy.Name())
+	}
+	if p := proxy.Unwrap(metadata); p != nil {
+		return FetchRawProxyAdapter(p, metadata, chains)
+	}
+	return proxy, chains
 }
 
 // UpdateProxies handle update proxies
@@ -267,41 +281,77 @@ func resolveMetadata(_ C.PlainContext, metadata *C.Metadata) (proxy C.Proxy, rul
 	return
 }
 
+func remoteResolveDNS(metadata *C.Metadata, proxy string, shouldRemoteResolve bool) (ok bool, err error) {
+	if proxy == "REJECT" {
+		return
+	}
+	if shouldRemoteResolve {
+		if proxy == "DIRECT" {
+			if !metadata.Resolved() {
+				var rAddr netip.Addr
+				rAddr, err = resolver.LookupFirstIP(context.Background(), metadata.Host)
+				if err != nil {
+					return
+				}
+				metadata.DstIP = rAddr
+			}
+		} else {
+			ok = true
+			var rAddr netip.Addr
+			rAddr, err = resolver.ResolveIPByProxy(metadata.Host, proxy, true)
+			if err != nil {
+				return
+			}
+			metadata.DstIP = rAddr
+		}
+	} else if !metadata.Resolved() {
+		var rAddr netip.Addr
+		rAddr, err = resolver.LookupFirstIP(context.Background(), metadata.Host)
+		if err != nil {
+			return
+		}
+		metadata.DstIP = rAddr
+	}
+	return
+}
+
 func handleUDPConn(packet *inbound.PacketAdapter) {
 	metadata := packet.Metadata()
 	if !metadata.Valid() {
 		log.Warn().Msgf("[Metadata] not valid: %#v", metadata)
+		packet.Drop()
 		return
 	}
 
-	// make a fAddr if request ip is fakeip
-	var fAddr netip.Addr
+	var (
+		fAddr netip.Addr // make a fAddr if request ip is fakeip
+		rKey  string     // localAddrPort + remoteFakeIP + remotePort
+		key   = packet.LocalAddr().String()
+	)
+
 	if resolver.IsExistFakeIP(metadata.DstIP) {
 		fAddr = metadata.DstIP
+		rKey = key + fAddr.String() + metadata.DstPort
 	}
 
 	if err := preHandleMetadata(metadata); err != nil {
 		log.Debug().Err(err).Msg("[Metadata] prehandle failed")
+		packet.Drop()
 		return
 	}
 
 	log.Debug().EmbedObject(metadata).Str("inbound", metadata.Type.String()).Msg("[UDP] accept session")
 
-	// local resolve UDP dns
-	if !metadata.Resolved() {
-		ip, err := resolver.LookupFirstIP(context.Background(), metadata.Host)
-		if err != nil {
-			log.Warn().Err(err).Msg("[Metadata] lookup IP failed")
-			return
-		}
-		metadata.DstIP = ip
-	}
-
-	key := packet.LocalAddr().String()
-
 	handle := func() bool {
 		pc := natTable.Get(key)
 		if pc != nil {
+			if !metadata.Resolved() {
+				if rAddr := addrTable.Get(rKey); rAddr.IsValid() {
+					metadata.DstIP = rAddr
+				} else {
+					return false
+				}
+			}
 			_ = handleUDPToRemote(packet, pc, metadata)
 			return true
 		}
@@ -324,33 +374,56 @@ func handleUDPConn(packet *inbound.PacketAdapter) {
 			return
 		}
 
+		var hdlErr error
+
 		defer func() {
 			natTable.Delete(lockKey)
 			cond.Broadcast()
+			if hdlErr != nil {
+				packet.Drop()
+			}
 		}()
 
 		pCtx := icontext.NewPacketConnContext(metadata)
-		proxy, rule, err := resolveMetadata(pCtx, metadata)
-		if err != nil {
-			log.Warn().Err(err).Msg("[Metadata] parse failed")
+		proxy, rule, hdlErr := resolveMetadata(pCtx, metadata)
+		if hdlErr != nil {
+			log.Warn().Err(hdlErr).Msg("[Metadata] parse failed")
+			return
+		}
+
+		rawProxy, chains := FetchRawProxyAdapter(proxy, metadata, []string{})
+		rawName := rawProxy.Name()
+
+		isRemote, hdlErr := remoteResolveDNS(metadata, rawName, shouldRemoteResolveIP(rawProxy))
+		if hdlErr != nil {
+			if isRemote {
+				log.Warn().Err(hdlErr).
+					Str("proxy", rawName).
+					Str("rAddr", metadata.RemoteAddress()).
+					Msg("[UDP] remote resolve DNS failed")
+			} else {
+				log.Warn().Err(hdlErr).
+					Str("rAddr", metadata.RemoteAddress()).
+					Msg("[UDP] resolve DNS failed")
+			}
 			return
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), C.DefaultUDPTimeout)
 		defer cancel()
-		metadataPure := metadata.Pure(false)
-		rawPc, err := proxy.ListenPacketContext(ctx, metadataPure)
-		if err != nil {
+
+		rawPc, hdlErr := rawProxy.ListenPacketContext(ctx, metadata.Pure(false))
+		if hdlErr != nil {
 			if rule == nil {
 				log.Warn().
-					Err(err).
-					Str("proxy", proxy.Name()).
+					Err(hdlErr).
+					Str("proxy", rawName).
 					Str("rAddr", metadata.RemoteAddress()).
 					Msg("[UDP] dial failed")
 			} else {
 				log.Warn().
-					Err(err).
-					Str("proxy", proxy.Name()).
+					Err(hdlErr).
+					Str("proxy", rawName).
 					Str("rAddr", metadata.RemoteAddress()).
 					Str("rule", rule.RuleType().String()).
 					Str("rulePayload", rule.Payload()).
@@ -359,8 +432,8 @@ func handleUDPConn(packet *inbound.PacketAdapter) {
 			return
 		}
 
-		if metadataPure.TempDstIP.IsValid() {
-			metadata.DstIP = metadataPure.TempDstIP
+		if len(chains) > 1 {
+			rawPc.SetChains(lo.Reverse(chains))
 		}
 
 		pCtx.InjectPacketConn(rawPc)
@@ -384,7 +457,11 @@ func handleUDPConn(packet *inbound.PacketAdapter) {
 		entry.Msg("[UDP] connected")
 
 		oAddr := metadata.DstIP
-		go handleUDPToLocal(packet.UDPPacket, pc, key, oAddr, fAddr)
+		go handleUDPToLocal(packet.UDPPacket, pc, key, rKey, oAddr, fAddr)
+
+		if rKey != "" {
+			addrTable.Set(rKey, oAddr)
+		}
 
 		natTable.Set(key, pc)
 		handle()
@@ -482,6 +559,13 @@ func shouldResolveIP(rule C.Rule, metadata *C.Metadata) bool {
 	return rule.ShouldResolveIP() && metadata.Host != "" && !metadata.DstIP.IsValid()
 }
 
+func shouldRemoteResolveIP(proxy C.Proxy) bool {
+	if proxy.Type() == C.WireGuard {
+		return proxy.(*A.Proxy).ProxyAdapter.(*outbound.WireGuard).RemoteDnsResolve()
+	}
+	return resolver.RemoteDnsResolve
+}
+
 func match(metadata *C.Metadata) (C.Proxy, C.Rule, error) {
 	configMux.RLock()
 	defer configMux.RUnlock()
@@ -498,13 +582,17 @@ func match(metadata *C.Metadata) (C.Proxy, C.Rule, error) {
 
 	for _, rule := range rules {
 		if !resolved && shouldResolveIP(rule, metadata) {
-			ip, err := resolver.ResolveIP(metadata.Host)
+			rAddrs, err := resolver.LookupIP(context.Background(), metadata.Host)
 			if err != nil {
 				log.Debug().
 					Err(err).
 					Str("host", metadata.Host).
 					Msg("[Matcher] resolve failed")
 			} else {
+				ip := rAddrs[0]
+				if l := len(rAddrs); l > 1 && metadata.NetWork != C.UDP {
+					ip = rAddrs[rand.Intn(l)]
+				}
 				log.Debug().
 					Str("host", metadata.Host).
 					Str("ip", ip.String()).

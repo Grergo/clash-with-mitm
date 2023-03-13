@@ -5,24 +5,21 @@ import (
 	"io"
 	"net"
 	"net/netip"
-	"runtime"
-	"strconv"
 	"sync"
 	"time"
 
 	"github.com/phuslu/log"
+	"gvisor.dev/gvisor/pkg/bufferv2"
 
 	"github.com/Dreamacro/clash/adapter/inbound"
 	"github.com/Dreamacro/clash/common/nnip"
 	"github.com/Dreamacro/clash/common/pool"
 	C "github.com/Dreamacro/clash/constant"
-	"github.com/Dreamacro/clash/context"
 	"github.com/Dreamacro/clash/listener/tun/device"
 	"github.com/Dreamacro/clash/listener/tun/ipstack"
 	D "github.com/Dreamacro/clash/listener/tun/ipstack/commons"
 	"github.com/Dreamacro/clash/listener/tun/ipstack/system/mars"
 	"github.com/Dreamacro/clash/listener/tun/ipstack/system/mars/nat"
-	"github.com/Dreamacro/clash/transport/socks5"
 )
 
 type sysStack struct {
@@ -98,9 +95,7 @@ func New(device device.Device, dnsHijack []C.DNSUrl, tunAddress netip.Prefix, tc
 
 			if D.ShouldHijackDns(dnsAddr, rAddrPort, "tcp") {
 				go func(dnsConn net.Conn, addr string) {
-					log.Debug().
-						Str("addr", addr).
-						Msg("[TUN] hijack tcp dns")
+					log.Debug().Str("addr", addr).Msg("[TUN] hijack tcp dns")
 
 					defer func(c net.Conn) {
 						_ = c.Close()
@@ -147,17 +142,7 @@ func New(device device.Device, dnsHijack []C.DNSUrl, tunAddress netip.Prefix, tc
 				continue
 			}
 
-			metadata := &C.Metadata{
-				NetWork: C.TCP,
-				Type:    C.TUN,
-				SrcIP:   lAddrPort.Addr(),
-				DstIP:   rAddrPort.Addr(),
-				SrcPort: strconv.FormatUint(uint64(lAddrPort.Port()), 10),
-				DstPort: strconv.FormatUint(uint64(rAddrPort.Port()), 10),
-				Host:    "",
-			}
-
-			tcpIn <- context.NewConnContext(conn, metadata)
+			tcpIn <- inbound.NewSocketBy(conn, lAddrPort, rAddrPort, C.TUN)
 		}
 
 		ipStack.wg.Done()
@@ -176,9 +161,7 @@ func New(device device.Device, dnsHijack []C.DNSUrl, tunAddress netip.Prefix, tc
 					break
 				}
 
-				log.Warn().
-					Err(err0).
-					Msg("[Stack] accept udp failed")
+				log.Warn().Err(err0).Msg("[Stack] accept udp failed")
 				continue
 			}
 
@@ -186,43 +169,38 @@ func New(device device.Device, dnsHijack []C.DNSUrl, tunAddress netip.Prefix, tc
 				continue
 			}
 
-			poolBuf := pool.Get(n)
-			_ = copy(poolBuf, buf[:n])
-			if D.ShouldHijackDns(dnsAddr, rAddrPort, "udp") {
-				go func(dnsUdp *nat.UDP, b []byte, rap, lap netip.AddrPort) {
-					defer func(bb []byte) {
-						_ = pool.Put(bb)
-					}(b)
+			data := bufferv2.NewViewWithData(buf[:n])
 
-					msg, err1 := D.RelayDnsPacket(b)
+			if D.ShouldHijackDns(dnsAddr, rAddrPort, "udp") {
+				go func(st *mars.StackListener, dat *bufferv2.View, rap, lap netip.AddrPort) {
+					log.Debug().Str("addr", rap.String()).Msg("[TUN] hijack udp dns")
+
+					defer dat.Release()
+
+					msg, err1 := D.RelayDnsPacket(dat.AsSlice())
 					if err1 != nil {
 						return
 					}
 
-					_, _ = dnsUdp.WriteTo(msg, rap, lap)
-
-					log.Debug().
-						Str("addr", rap.String()).
-						Msg("[TUN] hijack udp dns")
-				}(stack.UDP(), poolBuf, rAddrPort, lAddrPort)
+					_, _ = st.UDP().WriteTo(msg, rap, lap)
+				}(stack, data, rAddrPort, lAddrPort)
 
 				continue
 			}
 
 			pkt := &packet{
-				local: lAddrPort,
-				data:  poolBuf,
-				writeBack: func(b []byte, addr net.Addr) (int, error) {
-					a := addr.(*net.UDPAddr)
-					na, _ := netip.AddrFromSlice(a.IP)
-					na = na.WithZone(a.Zone)
-					return stack.UDP().WriteTo(b, netip.AddrPortFrom(na.Unmap(), uint16(a.Port)), lAddrPort)
-				},
+				sender: stack.UDP(),
+				lAddr:  lAddrPort,
+				data:   data,
 			}
 
 			select {
-			case udpIn <- inbound.NewPacket(socks5.AddrFromStdAddrPort(rAddrPort), pkt, C.TUN):
+			case udpIn <- inbound.NewPacketBy(pkt, lAddrPort, rAddrPort, C.TUN):
 			default:
+				log.Debug().
+					NetIPAddrPort("lAddrPort", lAddrPort).
+					NetIPAddrPort("rAddrPort", rAddrPort).
+					Msg("[Stack] drop udp packet, because inbound queue is full")
 				pkt.Drop()
 			}
 		}
@@ -231,17 +209,9 @@ func New(device device.Device, dnsHijack []C.DNSUrl, tunAddress netip.Prefix, tc
 	}
 
 	ipStack.once.Do(func() {
-		ipStack.wg.Add(1)
+		ipStack.wg.Add(2)
 		go tcp()
-
-		numUDPWorkers := 4
-		if num := runtime.GOMAXPROCS(0); num > numUDPWorkers {
-			numUDPWorkers = num
-		}
-		for i := 0; i < numUDPWorkers; i++ {
-			ipStack.wg.Add(1)
-			go udp()
-		}
+		go udp()
 	})
 
 	return ipStack, nil
