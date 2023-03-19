@@ -87,6 +87,7 @@ type DNS struct {
 	Hosts                 *trie.DomainTrie[netip.Addr]
 	NameServerPolicy      map[string]dns.NameServer
 	ProxyServerNameserver []dns.NameServer
+	SearchDomains         []string
 }
 
 // FallbackFilter config
@@ -174,6 +175,7 @@ type RawDNS struct {
 	DefaultNameserver     []string          `yaml:"default-nameserver"`
 	NameServerPolicy      map[string]string `yaml:"nameserver-policy"`
 	ProxyServerNameserver []string          `yaml:"proxy-server-nameserver"`
+	SearchDomains         []string          `yaml:"search-domains"`
 }
 
 type RawFallbackFilter struct {
@@ -975,6 +977,18 @@ func parseDNS(rawCfg *RawConfig, hosts *trie.DomainTrie[netip.Addr]) (*DNS, erro
 		dnsCfg.Hosts = hosts
 	}
 
+	if len(cfg.SearchDomains) != 0 {
+		for _, domain := range cfg.SearchDomains {
+			if strings.HasPrefix(domain, ".") || strings.HasSuffix(domain, ".") {
+				return nil, errors.New("search domains should not start or end with '.'")
+			}
+			if strings.Contains(domain, ":") {
+				return nil, errors.New("search domains are for ipv4 only and should not contain ports")
+			}
+		}
+		dnsCfg.SearchDomains = cfg.SearchDomains
+	}
+
 	return dnsCfg, nil
 }
 
@@ -1141,6 +1155,17 @@ func verifyScriptMatcher(config *Config, matchers map[string]C.Matcher) (err err
 		DstPort: "443",
 	}
 
+	metadata1 := &C.Metadata{
+		Type:    C.TUN,
+		NetWork: C.UDP,
+		Host:    "8.8.8.8",
+		SrcIP:   netip.MustParseAddr("192.168.1.123"),
+		SrcPort: "6789",
+		DstPort: "2023",
+	}
+
+	cases := []*C.Metadata{metadata, metadata1}
+
 	C.BackupScriptState()
 
 	C.GetScriptProxyProviders = func() map[string][]C.Proxy {
@@ -1155,14 +1180,17 @@ func verifyScriptMatcher(config *Config, matchers map[string]C.Matcher) (err err
 	defer C.RestoreScriptState()
 
 	for k, v := range matchers {
-		if k == "main" {
-			_, err = v.Eval(metadata)
-		} else {
-			_, err = v.Match(metadata)
-		}
-		if err != nil {
-			err = fmt.Errorf("verify script code failed: %w", err)
-			return
+		isMain := k == "main"
+		for i := range cases {
+			if isMain {
+				_, err = v.Eval(cases[i])
+			} else {
+				_, err = v.Match(cases[i])
+			}
+			if err != nil {
+				err = fmt.Errorf("verify script code failed: %w", err)
+				return
+			}
 		}
 	}
 

@@ -44,10 +44,10 @@ func ConfigInterfaceAddress(dev device.Device, addr netip.Prefix, _ int, autoRou
 		return err
 	}
 
-	_, err = cmd.ExecCmd(fmt.Sprintf("/usr/sbin/ipconfig set %s automatic-v6", interfaceName))
-	if err != nil {
-		return err
-	}
+	//_, err = cmd.ExecCmd(fmt.Sprintf("/usr/sbin/ipconfig set %s automatic-v6", interfaceName))
+	//if err != nil {
+	//	return err
+	//}
 
 	if autoRoute {
 		err = configInterfaceRouting(interfaceName, addr)
@@ -148,6 +148,7 @@ func StartDefaultInterfaceChangeMonitor() {
 			dialer.DefaultInterface.Store(interfaceName)
 
 			iface.FlushCache()
+			updateWireGuardBind()
 
 			log.Warn().
 				Str("old", old).
